@@ -239,7 +239,10 @@ def write_requirements(path):
     lines = [f"# python {sys.version.split()[0]} | torch built for CUDA {torch.version.cuda}"]
     for pkg in packages:
         try:
-            lines.append(f"{pkg}=={md.version(pkg)}")
+            installed = md.version(pkg)
+            pinned = installed.split("+")[0]        # drop local build tags such as "+cu130": PyPI does not host them,
+            note = f"  # installed build: {installed}" if pinned != installed else ""   # so the file stays installable
+            lines.append(f"{pkg}=={pinned}{note}")
         except md.PackageNotFoundError:
             lines.append(f"# {pkg}: not installed")
     Path(path).write_text("\n".join(lines) + "\n")
@@ -658,7 +661,15 @@ def make_tracker(args, ctx, config, run_name):
 # Main workflow
 # =============================================================================
 def main():
-    args = build_parser().parse_args()
+    parser = build_parser()
+    if any(m in sys.modules for m in ("ipykernel", "google.colab")):
+        # Inside a notebook kernel, sys.argv also holds the kernel's own flags (e.g. "-f kernel.json");
+        # ignore those instead of failing. Outside notebooks, unknown flags remain an error.
+        args, ignored = parser.parse_known_args()
+        if ignored:
+            print(f"(notebook kernel detected; ignoring arguments: {' '.join(ignored)})")
+    else:
+        args = parser.parse_args()
     determinism = set_seed(args.seed, args.deterministic)
     ctx = init_distributed(args.device)
     ctx.log(json.dumps(vars(args), indent=2))
