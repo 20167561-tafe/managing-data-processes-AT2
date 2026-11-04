@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# run_distributed.sh - fetch train.py from a (private) GitHub repo and run it,
-# with GPU detection + CPU fallback, validated pass-through arguments,
-# timestamped logs under runs/, and troubleshooting guidance for common errors.
+# run_distributed.sh - fetch train.py from a (private) GitHub repo and run it on one or several
+# GPUs: automatic GPU detection with single-process / CPU fallback, torchrun for multi-GPU,
+# validated pass-through arguments, timestamped logs under runs/, and troubleshooting guidance.
 #
 #   ./run_distributed.sh --help          full documentation
 #   ./run_distributed.sh --dry-run       do every check, print the command, don't train
@@ -10,7 +10,7 @@
 set -Eeuo pipefail
 
 readonly PROG="run_distributed.sh"
-readonly VERSION="1.0.0"
+readonly VERSION="1.2.0"
 readonly TOTAL_STEPS=5
 
 if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 2) )); then
@@ -37,13 +37,15 @@ DRY_RUN=0
 REPO_CACHE="${REPO_CACHE:-.repo_cache}"
 
 # Training options: validated here, forwarded to train.py only when given.
+# GIVEN holds what the user passed; DEFAULTS mirrors train.py's own defaults (used for messages,
+# the run header and the progress indicator) and must be kept in sync with them.
 TRAIN_ARGS=()
 EXTRA_ARGS=()
 declare -A GIVEN=()
 declare -A DEFAULTS=(
-  [seed]=42 [epochs]=4 [batch-size]=4 [lr]=0.001 [momentum]=0.9 [num-workers]=2
-  [log-interval]=2000 [data-dir]=/kaggle/working [save-path]=./cifar_net.pth
-  [wandb-mode]=online [wandb-project]=cifar10-cnn [deterministic]=on
+  [seed]=42 [epochs]=5 [batch-size]=128 [lr]=0.001 [optimizer]=adam [momentum]=0.9
+  [val-split]=0.1 [augment]=on [deterministic]=on [num-workers]=2 [log-interval]=100
+  [output-dir]=outputs [tracker]=wandb [wandb-mode]=online [project]=cifar10-cnn
 )
 
 # -----------------------------------------------------------------------------
@@ -59,7 +61,8 @@ USAGE
 WRAPPER OPTIONS
   --repo-url URL       Git repo to pull from.
                        default: $DEFAULT_REPO_URL
-  --ref REF            Branch, tag or commit SHA to run.            default: HEAD (default branch)
+  --ref REF            Branch, tag or FULL 40-char commit SHA.      default: HEAD (default branch)
+                       (abbreviated SHAs cannot be fetched by git; get the full one with 'git rev-parse')
   --script PATH        Script path inside the repo (relative).      default: train.py
   --device MODE        auto | cuda | cpu.                           default: auto
                          auto : use the GPU if PyTorch can really use it, otherwise fall back to CPU
@@ -67,9 +70,11 @@ WRAPPER OPTIONS
                          cpu  : never use a GPU
   --gpus LIST          Comma-separated GPU indices, e.g. 0 or 0,1.  default: all visible GPUs
   --launcher MODE      auto | python | torchrun.                    default: auto
-                         auto uses torchrun only if >1 GPU is selected AND train.py contains
-                         distributed code (init_process_group / DistributedDataParallel / LOCAL_RANK);
-                         otherwise a single 'python' process is used.
+                         auto    : torchrun (one process per GPU) when more than one GPU is selected
+                                   AND train.py contains distributed code; otherwise one plain
+                                   'python' process (the single-GPU / CPU fallback)
+                         torchrun: always use torchrun, even for one GPU
+                         python  : always a single process
   --runs-dir DIR       Where logs are written.                      default: runs
   --run-name NAME      Label added to the run id / log file name (A-Z a-z 0-9 . _ -)
   --dry-run            Run every check and print the command, but do not start training
@@ -77,21 +82,28 @@ WRAPPER OPTIONS
 
 TRAINING OPTIONS (validated, then passed through to train.py when given)
   Flags you omit are not sent, so train.py's own defaults apply (shown below).
-  --seed N               integer 0..4294967295                      default: ${DEFAULTS[seed]}
-  --deterministic        deterministic algorithms (slower)          default: on
+  --epochs N             passes over the training data, integer >= 1   default: ${DEFAULTS[epochs]}
+  --batch-size N         mini-batch size PER GPU/process, integer >= 1 default: ${DEFAULTS[batch-size]}
+                         (global batch = batch size x number of GPUs; shown in the run header)
+  --lr X                 learning rate, number > 0                     default: ${DEFAULTS[lr]}
+  --optimizer NAME       adam | sgd                                    default: ${DEFAULTS[optimizer]}
+  --momentum X           number from 0 to 1 (sgd only)                 default: ${DEFAULTS[momentum]}
+  --val-split X          fraction held out for validation, 0 < X <= 0.5 default: ${DEFAULTS[val-split]}
+  --augment              random crop + flip on training images         default: on
+  --no-augment           turn augmentation off
+  --seed N               integer 0..4294967295                         default: ${DEFAULTS[seed]}
+  --deterministic        deterministic algorithms (slower)             default: on
   --no-deterministic     turn deterministic mode off
-  --epochs N             integer >= 1                               default: ${DEFAULTS[epochs]}
-  --batch-size N         integer >= 1                               default: ${DEFAULTS[batch-size]}
-  --lr X                 learning rate, number > 0                  default: ${DEFAULTS[lr]}
-  --momentum X           number between 0 and 1                     default: ${DEFAULTS[momentum]}
-  --num-workers N        DataLoader workers, integer >= 0           default: ${DEFAULTS[num-workers]}
-  --log-interval N       print/log every N mini-batches, >= 1       default: ${DEFAULTS[log-interval]}
-  --data-dir DIR         dataset download/read location             default: ${DEFAULTS[data-dir]}
-                         (outside Kaggle, where that path doesn't exist, ./data is used instead)
-  --save-path FILE       where the trained weights are saved        default: ${DEFAULTS[save-path]}
-  --wandb-mode MODE      online | offline | disabled                default: ${DEFAULTS[wandb-mode]}
-  --wandb-project NAME   Weights & Biases project                   default: ${DEFAULTS[wandb-project]}
-  --wandb-run-name NAME  W&B run name                               default: the run id of this wrapper
+  --num-workers N        DataLoader workers per process, integer >= 0  default: ${DEFAULTS[num-workers]}
+  --log-interval N       print progress every N mini-batches, >= 1     default: ${DEFAULTS[log-interval]}
+  --data DIR             dataset location (alias: --data-dir)          default: <kaggle working dir>/data, else ./data
+  --output-dir DIR       parent folder for results; each run writes to DIR/<run id>/
+                         (checkpoints, metrics.csv, confusion matrix, requirements.txt)
+                                                                       default: ${DEFAULTS[output-dir]}
+  --tracker NAME         wandb | mlflow | none                         default: ${DEFAULTS[tracker]}
+                         (local CSV/JSON logs are written whichever tracker is chosen)
+  --wandb-mode MODE      online | offline | disabled (wandb only)      default: ${DEFAULTS[wandb-mode]}
+  --project NAME         W&B project / MLflow experiment name          default: ${DEFAULTS[project]}
 
 PASS-THROUGH
   Anything after a lone '--' is forwarded to train.py untouched and NOT validated:
@@ -103,11 +115,14 @@ ENVIRONMENT
                               command line or in the notebook source. It is used only for the fetch,
                               never written to disk or the log, and removed before train.py starts.
   WANDB_API_KEY               Weights & Biases key (train.py can also read a Kaggle secret).
+  MLFLOW_TRACKING_URI         MLflow server/database to log to (default: a database under --output-dir).
   PYTHON                      Python interpreter to use (default: python3, then python).
   REPO_CACHE                  Where the repo checkout is kept (default: .repo_cache).
 
 OUTPUT
   runs/<YYYYmmdd-HHMMSS>[_name].log    full timestamped log (also shown live); runs/latest.log -> newest
+  <output-dir>/<run id>/               checkpoints, metrics.csv, confusion matrix, requirements.txt, ...
+                                       (the run id = the log file name without .log; it is also the tracker run name)
 
 EXIT CODES
   0 success | $E_USAGE bad arguments | $E_PREREQ missing tool/package | $E_FETCH could not fetch the repo
@@ -115,16 +130,18 @@ EXIT CODES
   otherwise: train.py's own exit code
 
 EXAMPLES
-  ./$PROG --epochs 10 --seed 7 --batch-size 64 --run-name bs64
-  ./$PROG --device cpu --wandb-mode disabled
-  ./$PROG --gpus 0,1 --launcher torchrun --epochs 20
-  ./$PROG --ref 3f2a9c1 --dry-run
+  ./$PROG --epochs 10 --batch-size 64 --run-name bs64          (all GPUs found, else 1 GPU, else CPU)
+  ./$PROG --epochs 5 --batch-size 128 --lr 1e-3 --tracker wandb
+  ./$PROG --gpus 0,1 --launcher torchrun --epochs 20           (force 2-GPU torchrun)
+  ./$PROG --device cpu --tracker none
+  ./$PROG --optimizer sgd --lr 0.01 --no-augment --tracker mlflow
+  ./$PROG --ref my-branch --dry-run
 
 KAGGLE NOTEBOOK (pass the secret via the environment, never typed into a cell)
   import os
   from kaggle_secrets import UserSecretsClient
   os.environ["GITHUB_TOKEN"] = UserSecretsClient().get_secret("GITHUB_TOKEN")
-  !bash run_distributed.sh --epochs 10 --wandb-mode offline
+  !bash run_distributed.sh --epochs 10 --tracker wandb --wandb-mode offline
 EOF
 }
 
@@ -157,6 +174,11 @@ check_float_01() {    # opt value
     usage_error "invalid value for $1: '$2' (expected a number from 0 to 1; default ${DEFAULTS[${1#--}]})"
   fi
 }
+check_float_max() {   # opt value max   (number > 0 and <= max)
+  if [[ ! $2 =~ $FLOAT_RE ]] || ! awk -v v="$2" -v m="$3" 'BEGIN{exit !(v+0 > 0 && v+0 <= m+0)}'; then
+    usage_error "invalid value for $1: '$2' (expected a number above 0 and up to $3; default ${DEFAULTS[${1#--}]})"
+  fi
+}
 check_choice() {      # opt value choice...
   local o=$1 v=$2; shift 2
   local c
@@ -167,17 +189,18 @@ check_nonempty() { [[ -n $2 ]] || usage_error "$1 needs a non-empty value"; }
 
 add_train() {         # flag [value]
   local flag=$1 key=${1#--}
-  [[ $key == no-deterministic ]] && key=deterministic
+  [[ $key == no-* ]] && key=${key#no-}          # --no-augment / --no-deterministic share one setting
+  if [[ $flag == --data-dir ]]; then key=data; flag=--data; fi   # alias: forward the canonical name
   if [[ -n ${GIVEN[$key]+x} ]]; then
     usage_error "$flag was given more than once, or conflicts with another flag for the same setting; give it once"
   fi
   TRAIN_ARGS+=("$flag")
   if (($# > 1)); then TRAIN_ARGS+=("$2"); GIVEN[$key]=$2
-  elif [[ $flag == --no-deterministic ]]; then GIVEN[$key]=0
+  elif [[ $flag == --no-* ]]; then GIVEN[$key]=0
   else GIVEN[$key]=1; fi
 }
 
-VALUE_OPTS=" --repo-url --ref --script --device --gpus --launcher --runs-dir --run-name --seed --epochs --batch-size --lr --momentum --num-workers --log-interval --data-dir --save-path --wandb-mode --wandb-project --wandb-run-name "
+VALUE_OPTS=" --repo-url --ref --script --device --gpus --launcher --runs-dir --run-name --seed --epochs --batch-size --lr --optimizer --momentum --val-split --num-workers --log-interval --data --data-dir --output-dir --tracker --wandb-mode --project "
 
 parse_args() {
   local opt val inline
@@ -213,10 +236,13 @@ parse_args() {
       --log-interval)  check_int "$opt" "$val" 1 1000000000; add_train "$opt" "$val" ;;
       --lr)            check_float_pos "$opt" "$val";        add_train "$opt" "$val" ;;
       --momentum)      check_float_01 "$opt" "$val";         add_train "$opt" "$val" ;;
-      --data-dir|--save-path|--wandb-project|--wandb-run-name)
+      --val-split)     check_float_max "$opt" "$val" 0.5;    add_train "$opt" "$val" ;;
+      --optimizer)     check_choice "$opt" "$val" adam sgd;  add_train "$opt" "$val" ;;
+      --tracker)       check_choice "$opt" "$val" wandb mlflow none; add_train "$opt" "$val" ;;
+      --data|--data-dir|--output-dir|--project)
                        check_nonempty "$opt" "$val";         add_train "$opt" "$val" ;;
       --wandb-mode)    check_choice "$opt" "$val" online offline disabled; add_train "$opt" "$val" ;;
-      --deterministic|--no-deterministic) add_train "$opt" ;;
+      --deterministic|--no-deterministic|--augment|--no-augment) add_train "$opt" ;;
       --)  EXTRA_ARGS=("$@"); break ;;
       -*)  usage_error "unknown option '$opt'. If train.py supports it, pass it after '--' (e.g. -- $opt VALUE)." ;;
       *)   usage_error "unexpected argument '$opt'. Options start with '--'; extra train.py arguments go after '--'." ;;
@@ -230,12 +256,20 @@ parse_args() {
   if [[ $SCRIPT_REL == *.ipynb ]]; then
     usage_error "--script points at a notebook ('$SCRIPT_REL'); python cannot run .ipynb files. Export it first: jupyter nbconvert --to script"
   fi
+  if [[ $REF =~ ^[0-9a-fA-F]{7,39}$ ]]; then
+    printf '[warn]  --ref %s looks like an abbreviated commit SHA; git can only fetch a full 40-character SHA.\n' "$REF" >&2
+    printf '        If the fetch fails, use: git rev-parse %s   (in a clone of the repo) to get the full one.\n' "$REF" >&2
+  fi
   if [[ -n $GPUS && $DEVICE == cpu ]]; then
     printf '[warn]  --gpus %s ignored because --device cpu was given.\n' "$GPUS" >&2
+  fi
+  if [[ -n ${GIVEN[wandb-mode]+x} && -n ${GIVEN[tracker]+x} && ${GIVEN[tracker]} != wandb ]]; then
+    printf '[warn]  --wandb-mode has no effect with --tracker %s.\n' "${GIVEN[tracker]}" >&2
   fi
 }
 
 parse_args "$@"
+OUTPUT_DIR=${GIVEN[output-dir]:-${DEFAULTS[output-dir]}}
 
 # -----------------------------------------------------------------------------
 # Run identity, log file, shared state (all created before the logging pipeline)
@@ -252,6 +286,8 @@ ln -sfn "$RUN_ID.log" "$RUNS_DIR/latest.log" 2>/dev/null || true
 STATE_DIR=$(mktemp -d)
 PROGRESS_FILE="$STATE_DIR/progress"
 RC_FILE="$STATE_DIR/train_rc"
+MAIN_PID_FILE="$STATE_DIR/main.pid"
+MAIN_RC_FILE="$STATE_DIR/main.rc"
 START_MARK="$STATE_DIR/start_mark"
 touch "$START_MARK"
 trap 'rm -rf "$STATE_DIR"' EXIT
@@ -279,6 +315,7 @@ die() {   # die CODE "message" "hint"...
 fmt_dur() { local s=$1; printf '%02d:%02d:%02d' $((s/3600)) $((s%3600/60)) $((s%60)); }
 
 stream_filter() {
+  trap '' INT TERM HUP        # keep logging until main() closes the pipe, even while it shuts down
   local line total="" t0="" epoch pct now el eta
   while IFS= read -r line || [[ -n $line ]]; do
     if [[ $line == $'\001'* ]]; then printf '%s\n' "${line#?}"; continue; fi
@@ -373,7 +410,8 @@ fetch_repo() {
                  "  os.environ['GITHUB_TOKEN'] = UserSecretsClient().get_secret('GITHUB_TOKEN') before running this script." \
                  "A 404/'Repository not found' also means the token cannot see the repo (wrong owner, or missing permission)." ;;
       ref)     die "$E_FETCH" "Ref '$REF' was not found in the repository." \
-                 "Check the branch/tag/commit name; omit --ref to use the default branch." ;;
+                 "Check the branch/tag/commit name; omit --ref to use the default branch." \
+                 "$([[ $REF =~ ^[0-9a-fA-F]{7,39}$ ]] && echo "'git fetch' cannot fetch an abbreviated commit SHA: use the full 40-character SHA.")" ;;
       *)       die "$E_FETCH" "git fetch failed." "Output: $(head -n5 <<<"$out" | tr '\n' ' ')" \
                  "Check --repo-url ($REPO_URL) and --ref ($REF)." ;;
     esac
@@ -382,16 +420,16 @@ fetch_repo() {
 }
 
 # Probe PyTorch in a child process. Sets PROBE_* from key=value lines (never eval'd).
-PROBE_TORCH="" PROBE_TV="" PROBE_CUDA_VER="" PROBE_AVAIL=0 PROBE_COUNT=0 PROBE_NAMES="" PROBE_SMOKE="skipped" PROBE_ERR="" PROBE_MISSING=""
+PROBE_TORCH="" PROBE_TV="" PROBE_CUDA_VER="" PROBE_AVAIL=0 PROBE_COUNT=0 PROBE_NAMES="" PROBE_SMOKE="skipped" PROBE_ERR="" PROBE_MISSING="" PROBE_MISSING_OPT=""
 probe_torch() {
   local out k v
   out=$(PROBE_SMOKE_REQUEST="$1" "$PYTHON" - <<'PY' 2>&1 || true
 import os, importlib.util
-r = {"torch": "", "tv": "", "cuda_ver": "", "avail": "0", "count": "0", "names": "", "smoke": "skipped", "err": "", "missing": ""}
-mods = ["numpy", "pandas", "pyarrow", "PIL", "huggingface_hub", "matplotlib"]
-if os.environ.get("PROBE_NEED_WANDB") == "1":
-    mods.append("wandb")
-r["missing"] = ",".join(m for m in mods if importlib.util.find_spec(m) is None)
+r = {"torch": "", "tv": "", "cuda_ver": "", "avail": "0", "count": "0", "names": "", "smoke": "skipped", "err": "", "missing": "", "missing_opt": ""}
+required = ["numpy", "pandas", "pyarrow", "PIL"]
+optional = [m for m in os.environ.get("PROBE_OPT_MODS", "").split(",") if m]
+r["missing"] = ",".join(m for m in required if importlib.util.find_spec(m) is None)
+r["missing_opt"] = ",".join(m for m in optional if importlib.util.find_spec(m) is None)
 try:
     import torch
 except Exception as e:
@@ -434,7 +472,7 @@ PY
       PROBE_cuda_ver) PROBE_CUDA_VER=$v ;; PROBE_avail) PROBE_AVAIL=$v ;;
       PROBE_count) PROBE_COUNT=$v ;;       PROBE_names) PROBE_NAMES=$v ;;
       PROBE_smoke) PROBE_SMOKE=$v ;;       PROBE_err) PROBE_ERR=$v ;;
-      PROBE_missing) PROBE_MISSING=$v ;;
+      PROBE_missing) PROBE_MISSING=$v ;;   PROBE_missing_opt) PROBE_MISSING_OPT=$v ;;
     esac
   done <<<"$out"
   if [[ -z $PROBE_TORCH && -z $PROBE_ERR ]]; then
@@ -492,6 +530,11 @@ check_script_syntax() {
 import sys
 path = sys.argv[1]
 src = open(path, encoding="utf-8").read()
+# A notebook saved under a .py name is JSON, which Python happily compiles as a dict literal
+# (null/true/false are just undefined names), so it must be recognised before compiling.
+if src.lstrip().startswith("{") and '"nbformat"' in src:
+    print("NOTEBOOK-JSON")
+    sys.exit(2)
 try:
     compile(src, path, "exec")
 except SyntaxError as e:
@@ -500,6 +543,12 @@ except SyntaxError as e:
     sys.exit(1)
 PY
 ) || rc=$?
+  if ((rc == 2)) && [[ $out == NOTEBOOK-JSON ]]; then
+    err "$SCRIPT_REL is a Jupyter notebook (.ipynb JSON saved with a .py name), not a Python script."
+    hint "Python cannot run it: replace it in the repo with real script source (a plain .py file), then push again."
+    hint "  To convert a notebook: jupyter nbconvert --to script <notebook>.ipynb  (and delete any !pip / get_ipython() lines)."
+    exit "$E_SCRIPT"
+  fi
   if ((rc != 0)); then
     err "$SCRIPT_REL has a syntax error: $out"
     if grep -Eq '\| *[!%]' <<<"$out"; then
@@ -517,6 +566,22 @@ PY
 main() {
   set -Eeuo pipefail
   trap 'err "Unexpected failure at line $LINENO: $BASH_COMMAND"' ERR
+  echo "$BASHPID" > "$MAIN_PID_FILE"
+  trap 'echo $? > "$MAIN_RC_FILE"' EXIT          # lets the parent shell learn the real exit status
+  TRAIN_PID=""
+  on_signal() {            # SIGTERM from the parent (forwarded Ctrl-C / notebook interrupt / kill)
+    trap '' INT TERM
+    err "Interrupted - shutting down..."
+    if [[ -n $TRAIN_PID ]] && kill -0 "$TRAIN_PID" 2>/dev/null; then
+      info "Stopping training (pid $TRAIN_PID)..."
+      kill -TERM "$TRAIN_PID" 2>/dev/null || true
+      local i; for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$TRAIN_PID" 2>/dev/null || break; sleep 1; done
+      kill -KILL "$TRAIN_PID" 2>/dev/null || true
+      wait "$TRAIN_PID" 2>/dev/null || true
+    fi
+    exit "$E_INTERRUPT"
+  }
+  trap on_signal INT TERM
 
   raw "=============================================================="
   raw " $PROG $VERSION   run: $RUN_ID"
@@ -537,20 +602,19 @@ main() {
       "Use a newer interpreter: PYTHON=/path/to/python3.11 ./$PROG ..."
   ok "python $pyver ($PYTHON)"
 
-  # data dir default: train.py defaults to /kaggle/working, which only exists on Kaggle
-  local data_dir=${GIVEN[data-dir]:-${DEFAULTS[data-dir]}}
-  if [[ -z ${GIVEN[data-dir]+x} && ! -d /kaggle/working ]]; then
-    data_dir="$PWD/data"
-    DEFAULT_DATA_DIR_ARG=("--data-dir" "$data_dir")
-    info "/kaggle/working not found: using $data_dir for the dataset (override with --data-dir)."
+  # Dataset location: --data if given, else a 'data' folder inside Kaggle's working directory
+  # (which is only writable/persistent there), else ./data. The choice is passed to train.py explicitly.
+  local data_dir=${GIVEN[data]:-}
+  if [[ -z $data_dir ]]; then
+    if [[ -d /kaggle/working ]]; then data_dir=/kaggle/working/data; else data_dir="$PWD/data"; fi
+    DEFAULT_DATA_ARG=("--data" "$data_dir")
+    info "Dataset location: $data_dir (override with --data)."
   fi
   mkdir -p "$data_dir" 2>/dev/null && [[ -w $data_dir ]] || die "$E_PREREQ" \
-      "Cannot write to the data directory '$data_dir'." "Pick a writable one with --data-dir."
-  local save_path=${GIVEN[save-path]:-${DEFAULTS[save-path]}}
-  local save_parent; save_parent=$(dirname "$save_path")
-  mkdir -p "$save_parent" 2>/dev/null && [[ -w $save_parent ]] || die "$E_PREREQ" \
-      "Cannot write the model to '$save_path'." "Pick a writable location with --save-path."
-  ok "writable: data dir ($data_dir), model path ($save_path), runs dir ($RUNS_DIR)"
+      "Cannot write to the data directory '$data_dir'." "Pick a writable one with --data."
+  mkdir -p "$OUTPUT_DIR" 2>/dev/null && [[ -w $OUTPUT_DIR ]] || die "$E_PREREQ" \
+      "Cannot write results to '$OUTPUT_DIR'." "Pick a writable folder with --output-dir."
+  ok "writable: data dir ($data_dir), output dir ($OUTPUT_DIR), runs dir ($RUNS_DIR)"
   local free_kb; free_kb=$(df -Pk "$data_dir" 2>/dev/null | awk 'NR==2{print $4}')
   if [[ $free_kb =~ ^[0-9]+$ ]] && ((free_kb < 2*1024*1024)); then
     warn "Only $((free_kb/1024)) MiB free on the data volume; the CIFAR-10 download needs roughly 0.5 GiB."
@@ -586,20 +650,35 @@ main() {
   fi
   detect_nvidia_smi
   local want_smoke=1; [[ $DEVICE == cpu ]] && want_smoke=0
-  PROBE_NEED_WANDB=$([[ ${GIVEN[wandb-mode]:-online} == disabled ]] && echo 0 || echo 1) probe_torch "$want_smoke"
+  # Packages train.py can run without (it degrades gracefully) are only reported, not fatal.
+  local tracker=${GIVEN[tracker]:-${DEFAULTS[tracker]}} opt_mods="matplotlib,huggingface_hub"
+  if [[ $tracker == wandb && ${GIVEN[wandb-mode]:-${DEFAULTS[wandb-mode]}} != disabled ]]; then opt_mods+=",wandb"
+  elif [[ $tracker == mlflow ]]; then opt_mods+=",mlflow"; fi
+  PROBE_OPT_MODS=$opt_mods probe_torch "$want_smoke"
   if [[ -z $PROBE_TORCH || ( -n $PROBE_ERR && $PROBE_ERR == import\ * ) ]]; then
-    die "$E_PREREQ" "PyTorch could not be imported: ${PROBE_ERR:-unknown error}" \
+    die "$E_PREREQ" "PyTorch/torchvision could not be imported: ${PROBE_ERR:-unknown error}" \
         "Not installed: pip install torch torchvision" \
         "\"module 'torch' has no attribute '_utils'\" or similar: restart the session, make sure no file/folder named torch.py/torch/ is in $PWD," \
         "  and reinstall matching versions together: pip install --upgrade --force-reinstall torch torchvision"
   fi
   ok "torch $PROBE_TORCH, torchvision ${PROBE_TV:-?}, built for CUDA ${PROBE_CUDA_VER:-none}"
   if [[ -n $PROBE_MISSING ]]; then
-    warn "Python packages not installed: ${PROBE_MISSING//,/ }. train.py will fail when it imports them."
-    hint "Install: pip install ${PROBE_MISSING//,/ }"
+    warn "Required Python packages not installed: ${PROBE_MISSING//,/ }. train.py will fail when it imports them."
+    hint "Install: pip install ${PROBE_MISSING//,/ }   (PIL is installed as 'pillow')"
   fi
+  local pkg
+  for pkg in ${PROBE_MISSING_OPT//,/ }; do
+    case $pkg in
+      wandb|mlflow)     warn "$pkg is not installed: '--tracker $tracker' will fall back to the local CSV/JSON logs only."
+                        hint "pip install $pkg   (or choose --tracker none to silence this)" ;;
+      matplotlib)       warn "matplotlib is not installed: the confusion-matrix image will be skipped (the CSV is still written)."
+                        hint "pip install matplotlib" ;;
+      huggingface_hub)  warn "huggingface_hub is not installed: CIFAR-10 cannot be downloaded (fine if it is already under --data)."
+                        hint "pip install huggingface_hub" ;;
+    esac
+  done
 
-  USE_DEVICE=cpu; NPROC=1; SELECTED=""
+  USE_DEVICE=cpu; NPROC=1; SELECTED=""; CVD_VALUE=""; HW_DESC="CPU only ($cores cores)"
   if [[ $DEVICE == cpu ]]; then
     info "--device cpu: GPUs will not be used."
   elif [[ $PROBE_AVAIL == 1 && $PROBE_SMOKE == ok ]]; then
@@ -623,6 +702,15 @@ main() {
     fi
     USE_DEVICE=cuda
     NPROC=$(awk -F, '{print NF}' <<<"$SELECTED")
+    HW_DESC=""
+    for idx in ${SELECTED//,/ }; do HW_DESC+="${HW_DESC:+; }cuda:$idx ${n[10#$idx]}"; done
+    CVD_VALUE=$SELECTED
+    if [[ -n ${CUDA_VISIBLE_DEVICES:-} ]]; then      # --gpus indices are relative to what is already visible
+      local -a vis; IFS=',' read -ra vis <<<"$CUDA_VISIBLE_DEVICES"
+      CVD_VALUE=""
+      for idx in ${SELECTED//,/ }; do CVD_VALUE+="${vis[10#$idx]},"; done
+      CVD_VALUE=${CVD_VALUE%,}
+    fi
   else
     explain_gpu_problem
     if [[ $DEVICE == cuda ]]; then
@@ -645,30 +733,46 @@ main() {
   done
 
   local -a final_args=("${TRAIN_ARGS[@]+"${TRAIN_ARGS[@]}"}")
-  if [[ -n ${DEFAULT_DATA_DIR_ARG+x} ]] && grep -qF -- '--data-dir' "$script_path"; then
-    final_args+=("${DEFAULT_DATA_DIR_ARG[@]}")
+  if [[ -n ${DEFAULT_DATA_ARG+x} ]] && grep -qF -- '--data' "$script_path"; then
+    final_args+=("${DEFAULT_DATA_ARG[@]}")
   fi
-  if [[ -z ${GIVEN[wandb-run-name]+x} ]] && grep -qF -- '--wandb-run-name' "$script_path"; then
-    final_args+=(--wandb-run-name "$RUN_ID")
+  # The run id doubles as the tracker run name and the results sub-folder name, so logs, tracker
+  # runs and outputs of one execution can be matched up (skipped if --run-name is passed after '--').
+  if grep -qF -- '--run-name' "$script_path" && ! printf '%s\n' "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}" | grep -qx -- '--run-name'; then
+    final_args+=(--run-name "$RUN_ID")
   fi
   final_args+=("${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}")
 
   # W&B hint (train.py handles Kaggle secrets / offline fallback itself)
-  if [[ ${GIVEN[wandb-mode]:-online} == online && -z ${WANDB_API_KEY:-} ]]; then
+  if [[ $tracker == wandb && ${GIVEN[wandb-mode]:-online} == online && -z ${WANDB_API_KEY:-} ]]; then
     info "WANDB_API_KEY is not set in the environment; train.py will look for a Kaggle secret, else W&B falls back to offline."
   fi
 
   # does train.py actually use a GPU / support multiple processes? (static heuristics)
   local has_dist=0
   grep -Eq 'init_process_group|DistributedDataParallel|LOCAL_RANK' "$script_path" && has_dist=1
-  if [[ $USE_DEVICE == cuda ]] && ! grep -Eq '\.to\(|\.cuda\(' "$script_path"; then
-    warn "$SCRIPT_REL never moves the model/data to a device (.to(...)/.cuda()), so it will run on CPU despite the GPU."
-    hint "The wrapper exports RUN_DEVICE=cuda and CUDA_VISIBLE_DEVICES for scripts that want to use them."
+  if [[ $USE_DEVICE == cuda ]]; then
+    local first_dev first_train
+    first_dev=$(grep -nE '^[^#]*(\.to\(|\.cuda\()' "$script_path" | head -n1 | cut -d: -f1 || true)
+    first_train=$(grep -nE '^[^#]*\.backward\(' "$script_path" | head -n1 | cut -d: -f1 || true)
+    if [[ -z $first_dev ]]; then
+      warn "$SCRIPT_REL never moves the model/data to a device (.to(...)/.cuda()), so it will run on the CPU despite the GPU."
+      hint "Add: device = torch.device('cuda' if torch.cuda.is_available() else 'cpu'); net.to(device), and move each batch (inputs.to(device))."
+      hint "The wrapper exports RUN_DEVICE=cuda for scripts that want to read it."
+    elif [[ -n $first_train ]] && ((first_dev > first_train)); then
+      warn "$SCRIPT_REL first moves anything to a device at line $first_dev, AFTER the training loop starts (line $first_train):"
+      hint "training will run on the CPU despite the GPU. Create 'device' and call net.to(device) BEFORE the loop, and move"
+      hint "  every batch (inputs, labels = inputs.to(device), labels.to(device)) in the training AND evaluation loops."
+    fi
   fi
 
   local launcher=python
   case $LAUNCHER in
-    python) launcher=python ;;
+    python)
+      launcher=python
+      if ((NPROC > 1)); then
+        warn "--launcher python runs ONE process: only the first selected GPU (cuda:${SELECTED%%,*}) will be used."
+      fi ;;
     torchrun)
       launcher=torchrun
       ((has_dist)) || warn "--launcher torchrun but $SCRIPT_REL has no distributed code: $NPROC identical copies would each train on the full data."
@@ -687,9 +791,21 @@ main() {
     warn "torchrun without GPUs: falling back to a single python process."
     launcher=python; NPROC=1
   fi
+  if [[ $launcher == python && $USE_DEVICE == cuda ]]; then   # a single process drives exactly one GPU
+    NPROC=1; SELECTED=${SELECTED%%,*}; CVD_VALUE=${CVD_VALUE%%,*}
+  fi
+  case $launcher:$USE_DEVICE:$NPROC in
+    torchrun:cuda:1) info "Launch mode: torchrun with a single process (world size 1)." ;;
+    torchrun:*)      ok   "Launch mode: MULTI-GPU - torchrun starts $NPROC processes, one per GPU (world size $NPROC)."
+                     hint "--batch-size is per GPU, so the global batch is $NPROC x --batch-size." ;;
+    python:cuda:*)   info "Launch mode: single process on 1 GPU (a distributed launch is not needed or not possible here)." ;;
+    *)               info "Launch mode: single process on the CPU." ;;
+  esac
 
   local -a cmd
   if [[ $launcher == torchrun ]]; then
+    # 'python -m torch.distributed.run' is exactly what the torchrun command runs; --standalone picks a free
+    # local port for the rendezvous, so no MASTER_ADDR/PORT setup is needed on a single machine.
     cmd=("$PYTHON" -m torch.distributed.run --standalone --nproc_per_node="$NPROC" "$script_path")
   else
     cmd=("$PYTHON" -u "$script_path")
@@ -699,12 +815,15 @@ main() {
   # environment for train.py
   export PYTHONUNBUFFERED=1 MPLBACKEND=Agg HF_HUB_DISABLE_PROGRESS_BARS=1 RUN_ID RUN_DEVICE=$USE_DEVICE
   if [[ $USE_DEVICE == cuda ]]; then
-    export CUDA_VISIBLE_DEVICES=$SELECTED
+    export CUDA_VISIBLE_DEVICES=$CVD_VALUE
     [[ ${GIVEN[deterministic]:-1} == 0 ]] || export CUBLAS_WORKSPACE_CONFIG=:4096:8
   else
     export CUDA_VISIBLE_DEVICES=""
   fi
   [[ -n ${GIVEN[seed]+x} ]] && export PYTHONHASHSEED=${GIVEN[seed]}
+  if [[ $launcher == torchrun && -z ${OMP_NUM_THREADS:-} ]]; then   # share the CPU cores between processes
+    export OMP_NUM_THREADS=$(( cores / NPROC > 0 ? cores / NPROC : 1 ))
+  fi
 
   # total epochs for the progress indicator
   local epochs_total=${GIVEN[epochs]:-}
@@ -717,15 +836,22 @@ main() {
     ok "dataset already present under $data_dir"
   elif ! timeout 15 "$PYTHON" -c 'import socket; socket.gethostbyname("huggingface.co")' 2>/dev/null; then
     warn "huggingface.co is not reachable and no dataset was found under $data_dir: the download will fail."
-    hint "Kaggle: Session options -> Internet -> On, or attach a CIFAR-10 dataset and set --data-dir."
+    hint "Kaggle: Session options -> Internet -> On, or attach a CIFAR-10 dataset and set --data."
   fi
 
   raw ""
   raw "---------------------------- RUN HEADER ----------------------------"
   raw " repo     : $(sed -E 's#(https?://)[^/@]*@#\1#' <<<"$REPO_URL") @ $commit (ref $REF)"
   raw " script   : $SCRIPT_REL"
-  raw " device   : $USE_DEVICE${SELECTED:+ [GPUs $SELECTED]}   launcher: $launcher${NPROC:+ x$NPROC}"
-  raw " software : python $pyver, torch $PROBE_TORCH (CUDA ${PROBE_CUDA_VER:-none})"
+  local cfg_bs=${GIVEN[batch-size]:-${DEFAULTS[batch-size]}} cfg_aug=on cfg_det=on
+  [[ ${GIVEN[augment]:-1} == 0 ]] && cfg_aug=off
+  [[ ${GIVEN[deterministic]:-1} == 0 ]] && cfg_det=off
+  raw " hardware : $HW_DESC"
+  raw " device   : $USE_DEVICE${SELECTED:+ [GPUs $SELECTED]}   (cuda ${PROBE_CUDA_VER:-none}, torch $PROBE_TORCH)"
+  raw " world    : size $NPROC   launcher: $launcher$([[ $launcher == torchrun ]] && echo " (1 process per GPU)")"
+  raw " config   : epochs=${GIVEN[epochs]:-${DEFAULTS[epochs]}}  batch-size=$cfg_bs per process (global $((10#$cfg_bs * NPROC)))  lr=${GIVEN[lr]:-${DEFAULTS[lr]}}  optimizer=${GIVEN[optimizer]:-${DEFAULTS[optimizer]}}"
+  raw "            seed=${GIVEN[seed]:-${DEFAULTS[seed]}}  augment=$cfg_aug  deterministic=$cfg_det  val-split=${GIVEN[val-split]:-${DEFAULTS[val-split]}}  tracker=$tracker"
+  raw " software : python $pyver"
   raw " args     : ${final_args[*]+$(printf '%q ' "${final_args[@]}")}"
   raw "              (flags not shown use train.py defaults)"
   raw " log      : $LOG"
@@ -745,16 +871,7 @@ main() {
   local t_start=$SECONDS rc=0
   "${cmd[@]}" &
   TRAIN_PID=$!
-  on_signal() {
-    err "Interrupted - stopping training (pid $TRAIN_PID)..."
-    kill -TERM "$TRAIN_PID" 2>/dev/null || true
-    wait "$TRAIN_PID" 2>/dev/null || true
-    echo 130 > "$RC_FILE"
-    exit "$E_INTERRUPT"
-  }
-  trap on_signal INT TERM
   wait "$TRAIN_PID" || rc=$?
-  trap - INT TERM
   echo "$rc" > "$RC_FILE"
   if ((rc == 0)); then
     ok "train.py finished in $(fmt_dur $((SECONDS - t_start)))"
@@ -769,11 +886,15 @@ main() {
 # -----------------------------------------------------------------------------
 diagnose_failure() {   # log rc
   local tail_txt rc=$2 found=0 m
-  tail_txt=$(tail -n 400 "$1")
+  # Scan only what train.py itself printed: skip the run header and the launcher's own
+  # [info]/[warn]/hint lines, otherwise e.g. its WANDB_API_KEY notice would look like a W&B error.
+  tail_txt=$(sed -n '/^\[5\/5\] Training/,$p' "$1" \
+             | grep -vE '^[0-9-]+ [0-9:]+ +(\[( ok |info|warn|error|diag|prog)\]|->)' | tail -n 400 || true)
   has() { grep -Eqi -- "$1" <<<"$tail_txt"; }
   say "[diag]  Looking for known problems in the log..."
   if has 'CUDA out of memory|OutOfMemoryError'; then found=1
-    hint "GPU out of memory: lower --batch-size, free the GPU (check 'nvidia-smi' for other processes), or use --device cpu."; fi
+    hint "GPU out of memory: lower --batch-size (it is per GPU), reduce --num-workers, free the GPU (check 'nvidia-smi'"
+    hint "  for other processes), or use --device cpu."; fi
   if has 'no kernel image is available|not compatible with the current PyTorch'; then found=1
     hint "PyTorch has no kernels for this GPU architecture (e.g. P100/sm_60 with a new build): pick a T4 / install a matching build / --device cpu."; fi
   if has 'CUDA driver version is insufficient|NVIDIA driver on your system is too old|Torch not compiled with CUDA|Found no NVIDIA driver'; then found=1
@@ -784,21 +905,36 @@ diagnose_failure() {   # log rc
   if has "has no attribute '_utils'|partially initialized module|cannot import name"; then found=1
     hint "Broken/mismatched install or a shadowing file: restart the session, delete any torch.py in the working dir, then pip install --force-reinstall torch torchvision."; fi
   if has 'LocalEntryNotFoundError|Temporary failure in name resolution|Name or service not known|ConnectError|Max retries exceeded|Connection (reset|refused)'; then found=1
-    hint "No internet (dataset download or W&B). Kaggle: Session options -> Internet -> On. Or attach the dataset and use --data-dir; use --wandb-mode offline."; fi
+    hint "No internet (dataset download or tracker). Kaggle: Session options -> Internet -> On. Or attach the dataset and use --data;"
+    hint "  use --wandb-mode offline or --tracker none to train without a connection."; fi
   if has 'No (train|test) parquet found|AssertionError: No'; then found=1
-    hint "Dataset files not found under --data-dir: check the path and that the download finished (re-run with Internet on)."; fi
+    hint "Dataset files not found under --data: check the path and that the download finished (re-run with Internet on)."; fi
   if has 'unrecognized arguments|error: argument|invalid choice'; then found=1
     hint "train.py rejected an argument. Compare with 'python train.py --help'; unknown flags must come after '--'."; fi
   if has 'DataLoader worker|shared memory|/dev/shm|Bus error'; then found=1
     hint "DataLoader worker crashed (low shared memory/RAM): try --num-workers 0 (or 1) and a smaller --batch-size."; fi
-  if ((rc == 137)) || has '^Killed$'; then found=1
+  if ((rc == 137)) || has '[[:space:]]Killed$'; then found=1
     hint "Process was killed (exit 137), usually the OS out-of-memory killer: reduce --num-workers and --batch-size."; fi
   if has 'No space left on device'; then found=1
-    hint "Disk is full: free space, or point --data-dir/--save-path/--runs-dir at a larger volume."; fi
+    hint "Disk is full: free space, or point --data/--output-dir/--runs-dir at a larger volume."; fi
   if has 'PermissionError|Permission denied'; then found=1
-    hint "Permission problem: make --data-dir, --save-path and the runs directory writable."; fi
+    hint "Permission problem: make --data, --output-dir and the runs directory writable."; fi
   if has 'wandb.*(Error|error)|api_key|CommError|UsageError'; then found=1
-    hint "Weights & Biases problem: set WANDB_API_KEY (or a Kaggle secret), or run with --wandb-mode offline / disabled."; fi
+    hint "Weights & Biases problem: set WANDB_API_KEY (or a Kaggle secret), or use --wandb-mode offline / disabled, or --tracker none."; fi
+  if has 'mlflow.*(Exception|Error)|MlflowException'; then found=1
+    hint "MLflow problem: check MLFLOW_TRACKING_URI (or unset it to use the default database under --output-dir), or use --tracker none."; fi
+  # ---- multi-GPU / torchrun problems ----
+  if has 'NCCL (error|WARN)|ncclUnhandledCudaError|ncclSystemError|ncclInternalError|NCCL communicator was aborted|Duplicate GPU detected'; then found=1
+    hint "Multi-GPU communication (NCCL) failed. Confirm 'nvidia-smi' lists every GPU, then retry with NCCL_DEBUG=INFO for details."
+    hint "  Workarounds: NCCL_P2P_DISABLE=1 ./$PROG ...   or train on one GPU: --gpus 0 (or --launcher python)."; fi
+  if has 'Address already in use|EADDRINUSE|DistNetworkError|DistStoreError|Socket Timeout|rendezvous'; then found=1
+    hint "torchrun could not set up its local connection (port busy or blocked). A previous run may still be alive:"
+    hint "  stop it ('pkill -f train.py') and retry, or run on a single GPU with --launcher python."; fi
+  if has 'Watchdog caught collective operation timeout|Timed out initializing process group|Timeout.*(NCCL|collective)'; then found=1
+    hint "A worker stopped responding (crashed, out of memory, or stuck). Look for the first error above from any rank;"
+    hint "  re-running with --num-workers 0 and a smaller --batch-size often isolates the cause."; fi
+  if has 'ChildFailedError|torch\.distributed\.elastic'; then found=1
+    hint "One torchrun worker crashed. The first Traceback above the 'ChildFailedError' summary (see the rank/exitcode) is the real cause."; fi
   if has 'use_deterministic_algorithms|CUBLAS_WORKSPACE_CONFIG|does not have a deterministic implementation'; then found=1
     hint "Deterministic mode hit an unsupported operation: re-run with --no-deterministic."; fi
   if has 'Expected all tensors to be on the same device'; then found=1
@@ -825,21 +961,37 @@ final_report() {   # rc
   if [[ -f $RC_FILE ]] && ((rc != 0 && rc != E_INTERRUPT)); then
     diagnose_failure "$LOG" "$rc"
   fi
-  local sp=${GIVEN[save-path]:-${DEFAULTS[save-path]}}
-  [[ -f $sp && $sp -nt $START_MARK ]] && outputs="$sp"
+  # results folder of this run (train.py writes <output-dir>/<run id>/), if it produced anything new
+  local rd="$OUTPUT_DIR/$RUN_ID" files=""
+  if [[ -d $rd && -n $(find "$rd" -type f -newer "$START_MARK" -print -quit 2>/dev/null) ]]; then
+    outputs="$rd/"
+    files=$(find "$rd" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | sort | tr '\n' ' ')
+  fi
   raw ""
   raw "=============================================================="
   if ((rc == 0)); then raw " RESULT : SUCCESS"; else raw " RESULT : FAILED - exit code $rc ($meaning)"; fi
   raw " time   : $(fmt_dur "$secs")"
   raw " log    : $LOG   (latest: $RUNS_DIR/latest.log)"
-  [[ -n $outputs ]] && raw " output : $outputs"
+  if [[ -n $outputs ]]; then raw " results : $outputs"; raw " files   : $files"; fi
   if ((rc != 0)); then raw " help   : ./$PROG --help   (options, exit codes, examples)"; fi
   raw "=============================================================="
 }
 
+# Parent driver. main() runs in the background so this shell can react to Ctrl-C / a notebook
+# "Interrupt" immediately: the signal is forwarded to main() as SIGTERM, which stops train.py,
+# and the log still gets its closing lines and the final report.
+logpipe() { stream_filter | ( trap '' INT TERM HUP; exec tee -a "$LOG" ); }
+forward_signal() {
+  local p; p=$(cat "$MAIN_PID_FILE" 2>/dev/null || true)
+  if [[ -n $p ]]; then kill -TERM "$p" 2>/dev/null || true; fi
+}
 set +e
-main 2>&1 | stream_filter | tee -a "$LOG"
-RC=${PIPESTATUS[0]}
+trap forward_signal INT TERM HUP
+{ main 2>&1 | logpipe; } &
+PIPE_PID=$!
+while kill -0 "$PIPE_PID" 2>/dev/null; do wait "$PIPE_PID" 2>/dev/null; done
+RC=$(cat "$MAIN_RC_FILE" 2>/dev/null || true)
+[[ $RC =~ ^[0-9]+$ ]] || RC=1
 set -e
-final_report "$RC" "$SECONDS" 2>&1 | stream_filter | tee -a "$LOG"
+final_report "$RC" "$SECONDS" 2>&1 | logpipe
 exit "$RC"
